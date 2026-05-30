@@ -15,6 +15,10 @@ use tokio::time::{timeout, Duration};
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::health::DependencySeverity;
+
+pub mod ws_error;
+use ws_error::{validate_ws_token, validate_message_size, validate_message_structure};
 
 /// How often to send a ping frame to the client.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
@@ -42,9 +46,7 @@ pub struct TransactionStatusUpdate {
 /// Messages the server pushes to the client.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum ServerMessage<'a> {
-    /// A normal transaction-status broadcast.
-    Update(&'a TransactionStatusUpdate),
+enum ServerMessage {
     /// Notification that messages were dropped due to the client being slow.
     MessagesDropped { count: u64 },
     /// Response to a client `resync` request — latest N events from the DB.
@@ -74,9 +76,16 @@ pub async fn ws_handler(
     State(state): State<AppState>,
     connect_info: Option<ConnectInfo<SocketAddr>>,
 ) -> impl IntoResponse {
-    if let Some(token) = params.token {
-        if !validate_token(&token) {
-            tracing::warn!("Invalid WebSocket authentication token");
+    let token = match params.token {
+        Some(t) => match validate_ws_token(&t) {
+            Ok(_) => t,
+            Err(_) => {
+                tracing::warn!("Invalid WebSocket authentication token");
+                return axum::http::StatusCode::UNAUTHORIZED.into_response();
+            }
+        },
+        None => {
+            tracing::warn!("Missing WebSocket authentication token");
             return axum::http::StatusCode::UNAUTHORIZED.into_response();
         }
     };
@@ -85,6 +94,7 @@ pub async fn ws_handler(
         .map(|ci| ci.0.to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
+    let _ = token; // validated above
     ws.on_upgrade(move |socket| handle_socket(socket, state, client_addr))
 }
 
@@ -174,8 +184,7 @@ async fn handle_socket(socket: WebSocket, state: AppState, client_addr: String) 
                 result = rx.recv() => {
                     match result {
                         Ok(update) => {
-                            let payload = ServerMessage::Update(&update);
-                            let json = match serde_json::to_string(&payload) {
+                            let json = match serde_json::to_string(&update) {
                                 Ok(j) => j,
                                 Err(e) => {
                                     tracing::error!("Failed to serialize update: {}", e);
@@ -240,6 +249,17 @@ async fn handle_client_message(
     state: &AppState,
     client_addr: &str,
 ) {
+    // Validate message size first
+    if let Err(e) = validate_message_size(text) {
+        tracing::warn!(
+            client_addr = %client_addr,
+            error = %e,
+            "Message size validation failed"
+        );
+        return;
+    }
+
+    // Validate message structure
     let msg: ClientMessage = match serde_json::from_str(text) {
         Ok(m) => m,
         Err(_) => {
@@ -283,4 +303,132 @@ async fn handle_client_message(
 
 fn validate_token(token: &str) -> bool {
     !token.is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_validate_token_empty() {
+        assert!(!validate_token(""));
+    }
+
+    #[test]
+    fn test_validate_token_valid() {
+        assert!(validate_token("valid_token_123"));
+    }
+
+    #[test]
+    fn test_validate_token_whitespace() {
+        assert!(validate_token(" "));
+    }
+
+    #[test]
+    fn test_heartbeat_interval_constant() {
+        assert_eq!(HEARTBEAT_INTERVAL, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_pong_timeout_constant() {
+        assert_eq!(PONG_TIMEOUT, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_resync_default_limit() {
+        assert_eq!(RESYNC_DEFAULT_LIMIT, 20);
+    }
+
+    #[test]
+    fn test_resync_max_limit() {
+        assert_eq!(RESYNC_MAX_LIMIT, 100);
+    }
+
+    #[test]
+    fn test_client_message_resync_deserialization() {
+        let json = r#"{"type": "resync", "limit": 50}"#;
+        let msg: ClientMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            ClientMessage::Resync { limit } => {
+                assert_eq!(limit, Some(50));
+            }
+        }
+    }
+
+    #[test]
+    fn test_client_message_resync_no_limit() {
+        let json = r#"{"type": "resync"}"#;
+        let msg: ClientMessage = serde_json::from_str(json).unwrap();
+        match msg {
+            ClientMessage::Resync { limit } => {
+                assert_eq!(limit, None);
+            }
+        }
+    }
+
+    #[test]
+    fn test_server_message_messages_dropped_serialization() {
+        let msg = ServerMessage::MessagesDropped { count: 42 };
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("messages_dropped"));
+        assert!(json.contains("42"));
+    }
+
+    #[test]
+    fn test_transaction_status_update_serialization() {
+        let update = TransactionStatusUpdate {
+            transaction_id: Uuid::new_v4(),
+            tenant_id: Uuid::new_v4(),
+            status: "completed".to_string(),
+            timestamp: chrono::Utc::now(),
+            message: Some("Transaction processed".to_string()),
+        };
+        let json = serde_json::to_string(&update).unwrap();
+        assert!(json.contains("completed"));
+        assert!(json.contains("Transaction processed"));
+    }
+
+    #[test]
+    fn test_ws_query_token_present() {
+        let json = r#"{"token": "test_token"}"#;
+        let query: WsQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.token, Some("test_token".to_string()));
+    }
+
+    #[test]
+    fn test_ws_query_token_absent() {
+        let json = r#"{}"#;
+        let query: WsQuery = serde_json::from_str(json).unwrap();
+        assert_eq!(query.token, None);
+    }
+
+    #[test]
+    fn test_resync_limit_clamping_below_min() {
+        let limit = 0i64.clamp(1, RESYNC_MAX_LIMIT);
+        assert_eq!(limit, 1);
+    }
+
+    #[test]
+    fn test_resync_limit_clamping_above_max() {
+        let limit = 200i64.clamp(1, RESYNC_MAX_LIMIT);
+        assert_eq!(limit, RESYNC_MAX_LIMIT);
+    }
+
+    #[test]
+    fn test_resync_limit_clamping_within_range() {
+        let limit = 50i64.clamp(1, RESYNC_MAX_LIMIT);
+        assert_eq!(limit, 50);
+    }
+
+    #[test]
+    fn test_dependency_severity_critical() {
+        let severity = DependencySeverity::Critical;
+        assert_eq!(severity, DependencySeverity::Critical);
+    }
+
+    #[test]
+    fn test_dependency_severity_non_critical() {
+        let severity = DependencySeverity::NonCritical;
+        assert_eq!(severity, DependencySeverity::NonCritical);
+    }
 }

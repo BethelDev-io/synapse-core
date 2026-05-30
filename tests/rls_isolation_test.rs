@@ -11,21 +11,41 @@ use testcontainers::runners::AsyncRunner;
 use testcontainers_modules::postgres::Postgres;
 use uuid::Uuid;
 
-async fn setup_db() -> (PgPool, impl std::any::Any) {
+async fn setup_db() -> (PgPool, PgPool, impl std::any::Any) {
     let container = Postgres::default().start().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
     let url = format!("postgres://postgres:postgres@127.0.0.1:{}/postgres", port);
-    let pool = PgPool::connect(&url).await.unwrap();
-    let migrator = Migrator::new(Path::join(
-        Path::new(env!("CARGO_MANIFEST_DIR")),
-        "migrations",
-    ))
+    let admin_pool = PgPool::connect(&url).await.unwrap();
+    let migrator = Migrator::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations"))
+        .await
+        .unwrap();
+    migrator.run(&admin_pool).await.unwrap();
+
+    // Create a non-superuser role so RLS policies are enforced
+    sqlx::query("CREATE ROLE synapse_app LOGIN PASSWORD 'synapse_app'")
+        .execute(&admin_pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO synapse_app",
+    )
+    .execute(&admin_pool)
     .await
     .unwrap();
-    migrator.run(&pool).await.unwrap();
+    sqlx::query("GRANT USAGE ON SCHEMA public TO synapse_app")
+        .execute(&admin_pool)
+        .await
+        .unwrap();
 
-    // Create current-month partition
-    sqlx::query(r#"
+    let app_url = format!(
+        "postgres://synapse_app:synapse_app@127.0.0.1:{}/postgres",
+        port
+    );
+    let pool = PgPool::connect(&app_url).await.unwrap();
+
+    // Create current-month partition (needs superuser)
+    sqlx::query(
+        r#"
         DO $$
         DECLARE
             partition_date DATE;
@@ -41,21 +61,29 @@ async fn setup_db() -> (PgPool, impl std::any::Any) {
                 EXECUTE format('CREATE TABLE %I PARTITION OF transactions FOR VALUES FROM (%L) TO (%L)', partition_name, start_date, end_date);
             END IF;
         END $$;
-    "#).execute(&pool).await.unwrap();
+    "#,
+    )
+    .execute(&admin_pool)
+    .await
+    .unwrap();
 
-    (pool, container)
+    (pool, admin_pool, container)
 }
 
-/// Insert a transaction row with an explicit tenant_id.
+/// Insert a transaction row as the given tenant (sets tenant context on a dedicated connection).
 async fn insert_tx_for_tenant(pool: &PgPool, tenant_id: Uuid) -> Uuid {
     let id = Uuid::new_v4();
-    sqlx::query(r#"
-        INSERT INTO transactions (id, stellar_account, amount, asset_code, status, created_at, updated_at, tenant_id)
-        VALUES ($1, 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 100, 'USD', 'pending', NOW(), NOW(), $2)
-    "#)
+    let mut conn = pool.acquire().await.unwrap();
+    set_tenant_context(&mut conn, Some(tenant_id), false)
+        .await
+        .unwrap();
+    sqlx::query(
+        r#"INSERT INTO transactions (id, stellar_account, amount, asset_code, status, created_at, updated_at, tenant_id)
+           VALUES ($1, 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 100, 'USD', 'pending', NOW(), NOW(), $2)"#,
+    )
     .bind(id)
     .bind(tenant_id)
-    .execute(pool)
+    .execute(&mut *conn)
     .await
     .unwrap();
     id
@@ -64,15 +92,20 @@ async fn insert_tx_for_tenant(pool: &PgPool, tenant_id: Uuid) -> Uuid {
 #[tokio::test]
 #[ignore = "Requires Docker for testcontainers"]
 async fn test_tenant_a_cannot_see_tenant_b_transactions() {
-    let (pool, _c) = setup_db().await;
+    let (pool, _admin_pool, _c) = setup_db().await;
 
     let tenant_a = Uuid::new_v4();
     let tenant_b = Uuid::new_v4();
 
     // Insert tenants (required for FK)
     for (tid, name) in [(tenant_a, "TenantA"), (tenant_b, "TenantB")] {
-        sqlx::query("INSERT INTO tenants (tenant_id, name, webhook_secret, stellar_account, rate_limit_per_minute, is_active) VALUES ($1,$2,'','',60,true)")
-            .bind(tid).bind(name).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO tenants (tenant_id, name, api_key, webhook_secret, stellar_account, rate_limit_per_minute, is_active) VALUES ($1,$2,$3,'','',60,true)")
+            .bind(tid)
+            .bind(name)
+            .bind(Uuid::new_v4().to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     let tx_b = insert_tx_for_tenant(&pool, tenant_b).await;
@@ -98,14 +131,19 @@ async fn test_tenant_a_cannot_see_tenant_b_transactions() {
 #[tokio::test]
 #[ignore = "Requires Docker for testcontainers"]
 async fn test_admin_can_see_all_transactions() {
-    let (pool, _c) = setup_db().await;
+    let (pool, _admin_pool, _c) = setup_db().await;
 
     let tenant_a = Uuid::new_v4();
     let tenant_b = Uuid::new_v4();
 
     for (tid, name) in [(tenant_a, "AdminTA"), (tenant_b, "AdminTB")] {
-        sqlx::query("INSERT INTO tenants (tenant_id, name, webhook_secret, stellar_account, rate_limit_per_minute, is_active) VALUES ($1,$2,'','',60,true)")
-            .bind(tid).bind(name).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO tenants (tenant_id, name, api_key, webhook_secret, stellar_account, rate_limit_per_minute, is_active) VALUES ($1,$2,$3,'','',60,true)")
+            .bind(tid)
+            .bind(name)
+            .bind(Uuid::new_v4().to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     let tx_a = insert_tx_for_tenant(&pool, tenant_a).await;
@@ -131,20 +169,20 @@ async fn test_admin_can_see_all_transactions() {
 #[tokio::test]
 #[ignore = "Requires Docker for testcontainers"]
 async fn test_null_tenant_id_rows_visible_to_admin() {
-    let (pool, _c) = setup_db().await;
+    let (_pool, admin_pool, _c) = setup_db().await;
 
-    // Insert a legacy row with no tenant_id
+    // Insert a legacy row with no tenant_id — must use admin_pool to bypass INSERT policy
     let id = Uuid::new_v4();
-    sqlx::query(r#"
-        INSERT INTO transactions (id, stellar_account, amount, asset_code, status, created_at, updated_at)
-        VALUES ($1, 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 50, 'USD', 'pending', NOW(), NOW())
-    "#)
+    sqlx::query(
+        r#"INSERT INTO transactions (id, stellar_account, amount, asset_code, status, created_at, updated_at)
+           VALUES ($1, 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 50, 'USD', 'pending', NOW(), NOW())"#,
+    )
     .bind(id)
-    .execute(&pool)
+    .execute(&admin_pool)
     .await
     .unwrap();
 
-    let mut conn = pool.acquire().await.unwrap();
+    let mut conn = admin_pool.acquire().await.unwrap();
     set_tenant_context(&mut conn, None, true).await.unwrap();
 
     let row: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM transactions WHERE id = $1")

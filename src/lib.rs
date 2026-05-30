@@ -1,3 +1,4 @@
+pub mod cache;
 pub mod config;
 pub mod db;
 pub mod error;
@@ -16,6 +17,7 @@ pub mod telemetry;
 pub mod tenant;
 pub mod utils;
 pub mod validation;
+pub mod ws;
 
 pub use config::assets::AssetCache;
 
@@ -155,6 +157,10 @@ pub fn create_app(app_state: AppState) -> Router {
         .route(
             "/transactions",
             get(handlers::webhook::list_transactions_api),
+        )
+        .route(
+            "/transactions/search",
+            get(handlers::search::search_transactions_wrapper),
         )
         .route("/settlements", get(handlers::settlements::list_settlements))
         .route(
