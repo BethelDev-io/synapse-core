@@ -5,4 +5,6 @@ pub mod resources;
 
 pub use client::SynapseClient;
 pub use error::SynapseError;
-pub use models::{ListMeta, ListParams, Transaction, TransactionList};
+pub use models::{
+    ListMeta, ListParams, SearchParams, Transaction, TransactionList, TransactionSearch,
+};
